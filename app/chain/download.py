@@ -260,8 +260,14 @@ class DownloadChain(ChainBase):
             else:
                 # 未找到下载目录，且没有自定义下载目录
                 logger.error(f"未找到下载目录：{_media.type.value} {_media.title_year}")
-                self.messagehelper.put(f"{_media.type.value} {_media.title_year} 未找到下载目录！",
-                                       title="下载失败", role="system")
+                # 使用 post_message 主动发送消息到用户
+                self.post_message(Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    title="下载失败",
+                    text=f"{_media.type.value} {_media.title_year} 未找到下载目录！"
+                ))
                 return (None, "未找到下载目录") if return_detail else None
             fileURI = FileURI(storage=storage, path=download_dir.as_posix())
             download_dir = Path(fileURI.uri)

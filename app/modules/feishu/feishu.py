@@ -1,3 +1,4 @@
+
 import hashlib
 import base64
 import hmac
@@ -7,6 +8,7 @@ import json as json_lib
 import requests
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
+from collections import OrderedDict
 
 from app.core.config import settings
 from app.core.context import MediaInfo, Context
@@ -20,6 +22,7 @@ from app.schemas.types import EventType, MessageChannel
 try:
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import *
+    from lark_oapi.api.im.v2 import *
     from lark_oapi.ws.client import Client as WsClient
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.core.enum import LogLevel
@@ -88,6 +91,12 @@ class Feishu:
 
         # 用户会话映射，用于回复到正确的聊天
         self._user_chat_mapping: Dict[str, str] = {}
+
+        # 消息去重缓存，防止重复处理同一条消息
+        # 使用 OrderedDict 实现 LRU 缓存，最多保留 1000 条记录
+        self._processed_messages: OrderedDict[str, float] = OrderedDict()
+        self._message_cache_lock = threading.Lock()
+        self._message_cache_ttl = 300  # 消息缓存 TTL（秒），5 分钟内的消息不会重复处理
 
         # 长连接相关 - 使用官方 SDK
         self._ws_client: Optional[WsClient] = None
@@ -258,6 +267,51 @@ class Feishu:
         """
         return bool(self._webhook_url or (self._app_id and self._app_secret))
 
+    def _is_message_processed(self, message_id: str) -> bool:
+        """
+        检查消息是否已处理过
+        :param message_id: 消息 ID
+        :return: True 表示已处理过，False 表示未处理
+        """
+        if not message_id:
+            return False
+
+        current_time = time.time()
+
+        with self._message_cache_lock:
+            # 清理过期消息
+            self._cleanup_expired_messages(current_time)
+
+            # 检查是否在缓存中
+            if message_id in self._processed_messages:
+                logger.debug(f"消息已处理过，跳过：{message_id}")
+                return True
+
+            # 添加到缓存
+            self._processed_messages[message_id] = current_time
+
+            # 限制缓存大小
+            if len(self._processed_messages) > 1000:
+                self._processed_messages.popitem(last=False)
+
+            return False
+
+    def _cleanup_expired_messages(self, current_time: float):
+        """
+        清理过期的消息记录
+        :param current_time: 当前时间戳
+        """
+        expired_keys = []
+        for msg_id, timestamp in self._processed_messages.items():
+            if current_time - timestamp > self._message_cache_ttl:
+                expired_keys.append(msg_id)
+            else:
+                # OrderedDict 按插入顺序排序，遇到第一个未过期的就可以停止
+                break
+
+        for msg_id in expired_keys:
+            del self._processed_messages[msg_id]
+
     def _handle_receive_message(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         """
         处理接收到的消息事件
@@ -273,6 +327,14 @@ class Feishu:
             sender = getattr(event, 'sender', {})
             message = getattr(event, 'message', {})
 
+            # 获取消息 ID 用于去重
+            message_id = getattr(message, 'message_id', None)
+
+            # 检查消息是否已处理过
+            if self._is_message_processed(message_id):
+                logger.info(f"消息已处理过，跳过：{message_id}")
+                return
+
             # 获取用户 ID
             sender_id = getattr(sender, 'sender_id', {})
             userid = getattr(sender_id, 'open_id', None) or getattr(sender_id, 'union_id', None) or getattr(sender_id, 'user_id', None)
@@ -280,7 +342,6 @@ class Feishu:
 
             # 获取消息内容
             message_content = getattr(message, 'content', '')
-            message_id = getattr(message, 'message_id', None)
             chat_id = getattr(message, 'chat_id', None)
 
             # 解析消息内容
@@ -318,6 +379,7 @@ class Feishu:
     def _handle_card_action(self, data: P2CardActionTrigger) -> Optional[P2CardActionTriggerResponse]:
         """
         处理按钮回调事件
+        注意：飞书要求 3 秒内返回响应，所以需要异步处理消息
         """
         try:
             logger.info(f"收到飞书按钮回调：{data}")
@@ -331,6 +393,14 @@ class Feishu:
             action = getattr(event, 'action', {})
             message = getattr(event, 'message', {})
 
+            # 获取消息 ID 用于去重
+            message_id = getattr(message, 'message_id', None)
+
+            # 检查消息是否已处理过
+            if self._is_message_processed(message_id):
+                logger.info(f"按钮回调消息已处理过，跳过：{message_id}")
+                return None  # 返回 None 表示使用默认响应
+
             # 从 operator 获取用户 ID
             userid = getattr(operator, 'open_id', None) or getattr(operator, 'union_id', None) or getattr(operator, 'user_id', None)
             username = getattr(operator, 'name', '')
@@ -340,11 +410,7 @@ class Feishu:
                 callback_data = action_value.get('action', '')
             else:
                 callback_data = str(action_value)
-            message_id = getattr(message, 'message_id', None)
             chat_id = getattr(message, 'chat_id', None)
-
-            # 使用 CALLBACK 前缀标识按钮回调
-            text = f"CALLBACK:{callback_data}"
 
             logger.info(f"飞书按钮回调：userid={userid}, callback_data={callback_data}")
 
@@ -352,27 +418,23 @@ class Feishu:
             if userid and chat_id:
                 self._user_chat_mapping[userid] = chat_id
 
-            # 调用 MessageChain 处理回调
-            from app.chain.message import MessageChain
-            MessageChain().handle_message(
-                channel=MessageChannel.Feishu,
-                source=self._name,
-                userid=userid,
-                username=username,
-                text=f"CALLBACK:{callback_data}",
-                original_message_id=message_id,
-                original_chat_id=chat_id
-            )
+            # 在后台线程中处理消息（避免阻塞回调响应）
+            import threading
+            def handle_callback():
+                from app.chain.message import MessageChain
+                MessageChain().handle_message(
+                    channel=MessageChannel.Feishu,
+                    source=self._name,
+                    userid=userid,
+                    username=username,
+                    text=f"CALLBACK:{callback_data}",
+                    original_message_id=message_id,
+                    original_chat_id=chat_id
+                )
+            threading.Thread(target=handle_callback, daemon=True).start()
 
-            # 返回成功响应（使用正确的响应类型）
-            try:
-                from lark_oapi.api.im.v1.model.card_action_trigger_response import CardActionTriggerResponse
-                response = CardActionTriggerResponse()
-                response.config = {"wide_screen_mode": True}
-                return response
-            except ImportError:
-                # 如果找不到响应类型，返回空响应（飞书 SDK 会处理）
-                return None
+            # 立即返回成功响应（飞书要求 3 秒内）
+            return None  # 返回 None 表示使用默认响应，飞书 SDK 会自动处理
 
         except Exception as e:
             logger.error(f"处理飞书按钮回调失败：{e}", exc_info=True)
@@ -494,7 +556,7 @@ class Feishu:
     def _send_sdk_msg(self, title: str, text: str, image: str = None, link: str = None,
                       buttons: list = None, userid: str = None,
                       original_message_id: str = None, original_chat_id: str = None) -> bool:
-        """SDK 模式发送消息"""
+        """SDK 模式发送消息 - 使用 V2 卡片格式（按钮直接放在 elements 中）"""
         try:
             # 使用默认用户 ID
             if not userid:
@@ -503,10 +565,12 @@ class Feishu:
                     logger.error("未指定用户 ID 且未配置默认用户，消息无法发送")
                     return False
 
-            # 构造消息内容
+            # 构造 V2 卡片消息内容
             if buttons:
-                # 交互式卡片消息（处理 text 为 None 的情况）
+                # V2 交互式卡片消息
                 text_content = text if text else ""
+
+                # 构建卡片元素
                 elements = [
                     {
                         "tag": "div",
@@ -517,52 +581,62 @@ class Feishu:
                     }
                 ]
 
-                # buttons 是 List[List[Dict]] 结构，需要按行处理
+                # buttons 是 List[List[Dict]] 结构，按行处理
+                # V2 中使用 column_set 实现按钮横向排列
                 for button_row in buttons:
                     if isinstance(button_row, list):
-                        # 一行中的多个按钮
-                        actions = []
+                        columns = []
                         for btn in button_row:
-                            actions.append({
-                                "tag": "button",
-                                "text": {
-                                    "tag": "plain_text",
-                                    "content": btn.get("text", btn.get("label", "操作"))
-                                },
-                                "type": "primary",
-                                "value": {
-                                    "action": btn.get("value", btn.get("callback_data", "click"))
-                                }
-                            })
-                        if actions:
-                            elements.append({
-                                "tag": "action",
-                                "actions": actions
-                            })
-                    elif isinstance(button_row, dict):
-                        # 兼容旧版扁平结构（单个按钮字典）
-                        elements.append({
-                            "tag": "action",
-                            "actions": [
-                                {
-                                    "tag": "button",
-                                    "text": {
-                                        "tag": "plain_text",
-                                        "content": button_row.get("text", button_row.get("label", "操作"))
-                                    },
-                                    "type": "primary",
-                                    "value": {
-                                        "action": button_row.get("value", button_row.get("callback_data", "click"))
+                            columns.append({
+                                "tag": "column",
+                                "width": "auto",
+                                "weight": 1,
+                                "vertical_align": "top",
+                                "elements": [
+                                    {
+                                        "tag": "button",
+                                        "text": {
+                                            "tag": "plain_text",
+                                            "content": btn.get("text", btn.get("label", "操作"))
+                                        },
+                                        "type": "primary",
+                                        "behaviors": [
+                                            {
+                                                "type": "callback",
+                                                "value": {
+                                                    "action": btn.get("value", btn.get("callback_data", "click"))
+                                                }
+                                            }
+                                        ]
                                     }
-                                }
-                            ]
-                        })
+                                ]
+                            })
 
+                        if columns:
+                            elements.append({
+                                "tag": "column_set",
+                                "flex_mode": "flow",
+                                "background_style": "default",
+                                "columns": columns
+                            })
+
+                # V2 卡片格式 - 添加 schema 声明和 body 字段
                 content = {
+                    "schema": "2.0",  # V2 声明
                     "config": {
-                        "wide_screen_mode": True
+                        "wide_screen_mode": True,
+                        "update_multi": True  # V2 默认共享卡片
                     },
-                    "elements": elements
+                    "header": {
+                        "template": "blue",
+                        "title": {
+                            "tag": "plain_text",
+                            "content": title
+                        }
+                    },
+                    "body": {  # V2 新增 body 字段
+                        "elements": elements
+                    }
                 }
                 msg_type = "interactive"
             else:
@@ -573,11 +647,11 @@ class Feishu:
 
             # 判断是发送消息还是回复消息
             if original_message_id and original_chat_id:
-                # 回复消息
-                return self._reply_message(original_message_id, original_chat_id, msg_type, content, userid)
+                # 回复消息 - 使用 V2 API
+                return self._reply_message_v2(original_message_id, original_chat_id, msg_type, content, userid)
             else:
-                # 发送消息
-                return self._create_message(userid, msg_type, content)
+                # 发送消息 - 使用 V2 API
+                return self._create_message_v2(userid, msg_type, content)
 
         except Exception as e:
             logger.error(f"发送飞书 SDK 消息失败：{e}", exc_info=True)
@@ -650,6 +724,73 @@ class Feishu:
             logger.error(f"回复飞书消息失败：{e}", exc_info=True)
             return False
 
+    def _create_message_v2(self, userid: str, msg_type: str, content: Dict) -> bool:
+        """发送消息到飞书 - 使用 V1 API 发送 V2 格式卡片"""
+        try:
+            # 构建请求 - 使用 V1 API，但内容是 V2 格式
+            request = CreateMessageRequest.builder() \
+                .receive_id_type("open_id") \
+                .request_body(CreateMessageRequestBody.builder()
+                              .receive_id(userid)
+                              .msg_type(msg_type)
+                              .content(json_lib.dumps(content))
+                              .build()) \
+                .build()
+
+            # 创建客户端并发送请求 - 使用 V1 API
+            from lark_oapi.client import Client
+            client = Client.builder() \
+                .app_id(self._app_id) \
+                .app_secret(self._app_secret) \
+                .log_level(LogLevel.DEBUG) \
+                .build()
+
+            response = client.im.v1.message.create(request)
+
+            if response.success():
+                logger.info(f"飞书 V2 卡片消息发送成功：{json_lib.dumps(content)}")
+                return True
+            else:
+                logger.error(f"飞书 V2 卡片消息发送失败：{response.code}, {response.msg}")
+                return False
+
+        except Exception as e:
+            logger.error(f"发送飞书 V2 卡片消息失败：{e}", exc_info=True)
+            return False
+
+    def _reply_message_v2(self, message_id: str, chat_id: str, msg_type: str, content: Dict, userid: str) -> bool:
+        """回复消息到飞书 - 使用 V1 API 发送 V2 格式卡片"""
+        try:
+            # 构建请求 - 使用 V1 API，但内容是 V2 格式
+            request = ReplyMessageRequest.builder() \
+                .message_id(message_id) \
+                .request_body(ReplyMessageRequestBody.builder()
+                              .msg_type(msg_type)
+                              .content(json_lib.dumps(content))
+                              .build()) \
+                .build()
+
+            # 创建客户端并发送请求 - 使用 V1 API
+            from lark_oapi.client import Client
+            client = Client.builder() \
+                .app_id(self._app_id) \
+                .app_secret(self._app_secret) \
+                .log_level(LogLevel.DEBUG) \
+                .build()
+
+            response = client.im.v1.message.reply(request)
+
+            if response.success():
+                logger.info(f"飞书 V2 卡片回复消息发送成功：{json_lib.dumps(content)}")
+                return True
+            else:
+                logger.error(f"飞书 V2 卡片回复消息发送失败：{response.code}, {response.msg}")
+                return False
+
+        except Exception as e:
+            logger.error(f"回复飞书 V2 卡片消息失败：{e}", exc_info=True)
+            return False
+
     def send_medias_msg(self, title: str, medias: List[MediaInfo], userid: str = None,
                         buttons: list = None, original_message_id: str = None,
                         original_chat_id: str = None) -> bool:
@@ -669,13 +810,32 @@ class Feishu:
                           original_chat_id: str = None) -> bool:
         """发送种子信息消息"""
         text = ""
-        for torrent in torrents:
-            text += f"{torrent.torrent_info.title}\n"
+        for i, torrent in enumerate(torrents, 1):
+            torrent_info = torrent.torrent_info
+            meta_info = torrent.meta_info
             # 将大小转换成 M 或 G 格式
-            size = torrent.torrent_info.size
-            size_str = StringUtils.str_filesize(size) if size else "未知"
-            text += f"大小：{size_str}\n"
-            text += f"做种：{torrent.torrent_info.seeders}\n\n"
+            size_str = StringUtils.str_filesize(torrent_info.size) if torrent_info.size else "未知"
+            # 获取视频规格信息
+            resource_pix = meta_info.resource_pix if meta_info else None
+            video_encode = meta_info.video_encode if meta_info else None
+            # 构建规格标签
+            specs = []
+            if resource_pix:
+                specs.append(resource_pix)
+            if video_encode:
+                specs.append(video_encode)
+            specs_str = " ".join(specs) if specs else ""
+            # 格式：序号。资源名称
+            # 📦 大小  🔺 做种数  规格/站点
+            text += f"**{i}. {torrent_info.title}**\n"
+            line2 = f"📦 {size_str}  🔺 {torrent_info.seeders or 0}"
+            if specs_str:
+                line2 += f"  {specs_str}"
+            elif torrent_info.description:
+                line2 += f"  {torrent_info.description}"
+            elif torrent_info.site_name:
+                line2 += f"  {torrent_info.site_name}"
+            text += line2 + "\n\n"
         return self.send_msg(title, text, userid=userid, buttons=buttons,
                              original_message_id=original_message_id,
                              original_chat_id=original_chat_id)

@@ -587,20 +587,101 @@ class MessageChain(ChainBase):
             return
 
         # 解析系统回调数据
-        try:
-            page_text = callback_data.split("_", 1)[1]
-            self.handle_message(channel=channel, source=source, userid=userid, username=username,
-                                text=page_text,
-                                original_message_id=original_message_id, original_chat_id=original_chat_id)
-        except IndexError:
-            logger.error(f"回调数据格式错误：{callback_data}")
-            self.post_message(Notification(
-                channel=channel,
-                source=source,
-                userid=userid,
-                username=username,
-                title="回调数据格式错误，请检查！"
-            ))
+
+        # 处理 select_ 回调（媒体选择）
+        if callback_data.startswith('select_'):
+            try:
+                page_text = callback_data.split("_", 1)[1]
+                self.handle_message(channel=channel, source=source, userid=userid, username=username,
+                                    text=page_text,
+                                    original_message_id=original_message_id, original_chat_id=original_chat_id)
+                return
+            except IndexError:
+                logger.error(f"回调数据格式错误：{callback_data}")
+                self.post_message(Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="回调数据格式错误，请检查！"
+                ))
+                return
+
+        # 处理 download_ 回调（下载选择）
+        if callback_data.startswith('download_'):
+            try:
+                download_index = callback_data.split("_", 1)[1]
+                # 直接处理下载逻辑
+                self._handle_download_callback(download_index, channel, source, userid, username,
+                                               original_message_id, original_chat_id)
+                return
+            except IndexError:
+                logger.error(f"回调数据格式错误：{callback_data}")
+                self.post_message(Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="回调数据格式错误，请检查！"
+                ))
+                return
+
+        # 处理 page_ 回调（分页）
+        if callback_data.startswith('page_'):
+            try:
+                page_action = callback_data.split("_", 1)[1]
+                self.handle_message(channel=channel, source=source, userid=userid, username=username,
+                                    text=page_action,
+                                    original_message_id=original_message_id, original_chat_id=original_chat_id)
+                return
+            except IndexError:
+                logger.error(f"回调数据格式错误：{callback_data}")
+                self.post_message(Notification(
+                    channel=channel,
+                    source=source,
+                    userid=userid,
+                    username=username,
+                    title="回调数据格式错误，请检查！"
+                ))
+                return
+
+    def _handle_download_callback(self, download_index: str, channel: MessageChannel, source: str,
+                                   userid: Union[str, int], username: str,
+                                   original_message_id: Optional[Union[str, int]] = None,
+                                   original_chat_id: Optional[str] = None) -> None:
+        """
+        处理下载按钮回调
+        :param download_index: 下载索引（0 表示自动下载）
+        :param channel: 消息渠道
+        :param source: 来源
+        :param userid: 用户 ID
+        :param username: 用户名
+        :param original_message_id: 原消息 ID
+        :param original_chat_id: 原聊天 ID
+        """
+        # 加载缓存
+        user_cache: Dict[str, dict] = self.load_cache(self._cache_file) or {}
+        cache_data: dict = user_cache.get(userid)
+        if not cache_data or not cache_data.get('items'):
+            self.post_message(Notification(channel=channel, source=source, title="无可用资源，请重新搜索！", userid=userid))
+            return
+
+        cache_list: list[Context] = cache_data.get('items')
+        download_idx = int(download_index)
+
+        if download_idx == 0:
+            # 自动选择下载
+            self.__auto_download(channel=channel, source=source, cache_list=cache_list,
+                                 userid=userid, username=username)
+        else:
+            # 下载指定资源
+            if download_idx > len(cache_list):
+                self.post_message(Notification(channel=channel, source=source, title="输入有误！", userid=userid))
+                return
+            context = cache_list[download_idx - 1]
+            # 开始下载
+            DownloadChain().download_single(context, channel=channel, source=source,
+                                           userid=userid, username=username)
 
     def __auto_download(self, channel: MessageChannel, source: str, cache_list: list[Context],
                         userid: Union[str, int], username: str,
@@ -790,43 +871,27 @@ class MessageChain(ChainBase):
         global _current_page
 
         buttons = []
-        max_text_length = ChannelCapabilityManager.get_max_button_text_length(channel)
         max_per_row = ChannelCapabilityManager.get_max_buttons_per_row(channel)
 
         # 自动选择按钮
         buttons.append([{"text": "🤖 自动选择下载", "callback_data": "download_0"}])
 
-        # 为每个种子项创建下载按钮
+        # 为每个种子项创建下载按钮 - 每行显示多个按钮
         current_row = []
         for i in range(len(items)):
-            context = items[i]
-            torrent = context.torrent_info
+            current_row.append({
+                "text": str(i + 1),
+                "callback_data": f"download_{i + 1}"
+            })
+            # 如果当前行已满，添加到按钮列表
+            if len(current_row) == max_per_row:
+                buttons.append(current_row)
+                current_row = []
+        # 添加最后一行（如果有剩余按钮）
+        if current_row:
+            buttons.append(current_row)
 
-            if max_per_row == 1:
-                # 每行一个按钮，使用完整文本
-                button_text = f"{i + 1}. {torrent.site_name} - {torrent.seeders}↑"
-                if len(button_text) > max_text_length:
-                    button_text = button_text[:max_text_length - 3] + "..."
-
-                buttons.append([{
-                    "text": button_text,
-                    "callback_data": f"download_{i + 1}"
-                }])
-            else:
-                # 多按钮一行的情况，使用简化文本
-                button_text = f"{i + 1}"
-
-                current_row.append({
-                    "text": button_text,
-                    "callback_data": f"download_{i + 1}"
-                })
-
-                # 如果当前行已满或者是最后一个按钮，添加到按钮列表
-                if len(current_row) == max_per_row or i == len(items) - 1:
-                    buttons.append(current_row)
-                    current_row = []
-
-        # 添加翻页按钮
+        # 添加翻页按钮（只在最后）
         if total > self._page_size:
             page_buttons = []
             if _current_page > 0:
