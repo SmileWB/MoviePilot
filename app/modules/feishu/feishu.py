@@ -326,12 +326,14 @@ class Feishu:
             if not event:
                 return None
 
-            sender = getattr(event, 'sender', {})
+            # 注意：按钮回调使用 operator 字段，不是 sender
+            operator = getattr(event, 'operator', {})
             action = getattr(event, 'action', {})
             message = getattr(event, 'message', {})
 
-            userid = getattr(getattr(sender, 'sender_id', {}), 'union_id', None)
-            username = getattr(sender, 'name', '')
+            # 从 operator 获取用户 ID
+            userid = getattr(operator, 'open_id', None) or getattr(operator, 'union_id', None) or getattr(operator, 'user_id', None)
+            username = getattr(operator, 'name', '')
             # action.value 是一个字典，包含 {"action": "callback_data"}
             action_value = getattr(action, 'value', {})
             if isinstance(action_value, dict):
@@ -362,10 +364,15 @@ class Feishu:
                 original_chat_id=chat_id
             )
 
-            # 返回成功响应
-            response = lark.P2CardActionTriggerResponse()
-            response.type = "ephemeral"
-            return response
+            # 返回成功响应（使用正确的响应类型）
+            try:
+                from lark_oapi.api.im.v1.model.card_action_trigger_response import CardActionTriggerResponse
+                response = CardActionTriggerResponse()
+                response.config = {"wide_screen_mode": True}
+                return response
+            except ImportError:
+                # 如果找不到响应类型，返回空响应（飞书 SDK 会处理）
+                return None
 
         except Exception as e:
             logger.error(f"处理飞书按钮回调失败：{e}", exc_info=True)
@@ -498,13 +505,14 @@ class Feishu:
 
             # 构造消息内容
             if buttons:
-                # 交互式卡片消息
+                # 交互式卡片消息（处理 text 为 None 的情况）
+                text_content = text if text else ""
                 elements = [
                     {
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**{title}**\n{text}"
+                            "content": f"**{title}**\n{text_content}" if text_content else f"**{title}**"
                         }
                     }
                 ]
@@ -558,8 +566,9 @@ class Feishu:
                 }
                 msg_type = "interactive"
             else:
-                # 普通文本消息
-                content = {"text": f"**{title}**\n{text}"}
+                # 普通文本消息（处理 text 为 None 的情况）
+                text_content = text if text else ""
+                content = {"text": f"**{title}**\n{text_content}" if text_content else title}
                 msg_type = "text"
 
             # 判断是发送消息还是回复消息
@@ -662,7 +671,10 @@ class Feishu:
         text = ""
         for torrent in torrents:
             text += f"{torrent.torrent_info.title}\n"
-            text += f"大小：{torrent.torrent_info.size}\n"
+            # 将大小转换成 M 或 G 格式
+            size = torrent.torrent_info.size
+            size_str = StringUtils.str_filesize(size) if size else "未知"
+            text += f"大小：{size_str}\n"
             text += f"做种：{torrent.torrent_info.seeders}\n\n"
         return self.send_msg(title, text, userid=userid, buttons=buttons,
                              original_message_id=original_message_id,
