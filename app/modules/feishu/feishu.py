@@ -505,7 +505,8 @@ class Feishu:
 
     def send_msg(self, title: str, text: str, image: str = None, link: str = None,
                  buttons: list = None, userid: str = None,
-                 original_message_id: str = None, original_chat_id: str = None) -> bool:
+                 original_message_id: str = None, original_chat_id: str = None,
+                 card_title: str = None) -> bool:
         """
         发送文本消息
         """
@@ -513,7 +514,7 @@ class Feishu:
             return self._send_webhook_msg(title, text, image, link, buttons)
         else:
             return self._send_sdk_msg(title, text, image, link, buttons, userid,
-                                      original_message_id, original_chat_id)
+                                      original_message_id, original_chat_id, card_title)
 
     def _send_webhook_msg(self, title: str, text: str, image: str = None,
                           link: str = None, buttons: list = None) -> bool:
@@ -555,8 +556,11 @@ class Feishu:
 
     def _send_sdk_msg(self, title: str, text: str, image: str = None, link: str = None,
                       buttons: list = None, userid: str = None,
-                      original_message_id: str = None, original_chat_id: str = None) -> bool:
-        """SDK 模式发送消息 - 使用 V2 卡片格式（按钮直接放在 elements 中）"""
+                      original_message_id: str = None, original_chat_id: str = None,
+                      card_title: str = None) -> bool:
+        """SDK 模式发送消息 - 使用 V2 卡片格式（按钮直接放在 elements 中）
+        :param card_title: 卡片 header 标题，默认为 title
+        """
         try:
             # 使用默认用户 ID
             if not userid:
@@ -631,7 +635,7 @@ class Feishu:
                         "template": "blue",
                         "title": {
                             "tag": "plain_text",
-                            "content": title
+                            "content": card_title if card_title else title
                         }
                     },
                     "body": {  # V2 新增 body 字段
@@ -803,7 +807,8 @@ class Feishu:
             text += "\n"
         return self.send_msg(title, text, userid=userid, buttons=buttons,
                              original_message_id=original_message_id,
-                             original_chat_id=original_chat_id)
+                             original_chat_id=original_chat_id,
+                             card_title="媒体列表")
 
     def send_torrents_msg(self, title: str, torrents: List[Context], userid: str = None,
                           buttons: list = None, original_message_id: str = None,
@@ -838,7 +843,8 @@ class Feishu:
             text += line2 + "\n\n"
         return self.send_msg(title, text, userid=userid, buttons=buttons,
                              original_message_id=original_message_id,
-                             original_chat_id=original_chat_id)
+                             original_chat_id=original_chat_id,
+                             card_title="种子列表")
 
     def delete_msg(self, message_id: str, chat_id: str = None) -> bool:
         """删除消息"""
