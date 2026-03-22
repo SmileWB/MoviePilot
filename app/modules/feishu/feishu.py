@@ -14,7 +14,7 @@ from app.core.metainfo import MetaInfo
 from app.log import logger
 from app.utils.string import StringUtils
 from app.utils.http import RequestUtils
-from app.schemas.types import EventType
+from app.schemas.types import EventType, MessageChannel
 
 # 导入官方 SDK
 try:
@@ -301,20 +301,16 @@ class Feishu:
             if userid and chat_id:
                 self._user_chat_mapping[userid] = chat_id
 
-            # 转发消息到消息处理系统
-            from app.core.event import eventmanager
-            from app.schemas.types import EventType
-            eventmanager.send_event(
-                EventType.UserMessage,
-                {
-                    'channel': 'feishu',
-                    'source': self._name,
-                    'userid': userid,
-                    'username': username,
-                    'text': text,
-                    'message_id': message_id,
-                    'chat_id': chat_id
-                }
+            # 调用 MessageChain 处理消息
+            from app.chain.message import MessageChain
+            MessageChain().handle_message(
+                channel=MessageChannel.Feishu,
+                source=self._name,
+                userid=userid,
+                username=username,
+                text=text,
+                original_message_id=message_id,
+                original_chat_id=chat_id
             )
         except Exception as e:
             logger.error(f"处理飞书消息失败：{e}", exc_info=True)
@@ -336,7 +332,12 @@ class Feishu:
 
             userid = getattr(getattr(sender, 'sender_id', {}), 'union_id', None)
             username = getattr(sender, 'name', '')
-            callback_data = getattr(action, 'value', '')
+            # action.value 是一个字典，包含 {"action": "callback_data"}
+            action_value = getattr(action, 'value', {})
+            if isinstance(action_value, dict):
+                callback_data = action_value.get('action', '')
+            else:
+                callback_data = str(action_value)
             message_id = getattr(message, 'message_id', None)
             chat_id = getattr(message, 'chat_id', None)
 
@@ -349,22 +350,16 @@ class Feishu:
             if userid and chat_id:
                 self._user_chat_mapping[userid] = chat_id
 
-            # 转发消息到消息处理系统
-            from app.core.event import eventmanager
-            from app.schemas.types import EventType
-            eventmanager.send_event(
-                EventType.UserMessage,
-                {
-                    'channel': 'feishu',
-                    'source': self._name,
-                    'userid': userid,
-                    'username': username,
-                    'text': text,
-                    'is_callback': True,
-                    'callback_data': callback_data,
-                    'message_id': message_id,
-                    'chat_id': chat_id
-                }
+            # 调用 MessageChain 处理回调
+            from app.chain.message import MessageChain
+            MessageChain().handle_message(
+                channel=MessageChannel.Feishu,
+                source=self._name,
+                userid=userid,
+                username=username,
+                text=f"CALLBACK:{callback_data}",
+                original_message_id=message_id,
+                original_chat_id=chat_id
             )
 
             # 返回成功响应
@@ -514,11 +509,13 @@ class Feishu:
                     }
                 ]
 
-                for btn in buttons:
-                    elements.append({
-                        "tag": "action",
-                        "actions": [
-                            {
+                # buttons 是 List[List[Dict]] 结构，需要按行处理
+                for button_row in buttons:
+                    if isinstance(button_row, list):
+                        # 一行中的多个按钮
+                        actions = []
+                        for btn in button_row:
+                            actions.append({
                                 "tag": "button",
                                 "text": {
                                     "tag": "plain_text",
@@ -526,11 +523,32 @@ class Feishu:
                                 },
                                 "type": "primary",
                                 "value": {
-                                    "action": btn.get("value", "click")
+                                    "action": btn.get("value", btn.get("callback_data", "click"))
                                 }
-                            }
-                        ]
-                    })
+                            })
+                        if actions:
+                            elements.append({
+                                "tag": "action",
+                                "actions": actions
+                            })
+                    elif isinstance(button_row, dict):
+                        # 兼容旧版扁平结构（单个按钮字典）
+                        elements.append({
+                            "tag": "action",
+                            "actions": [
+                                {
+                                    "tag": "button",
+                                    "text": {
+                                        "tag": "plain_text",
+                                        "content": button_row.get("text", button_row.get("label", "操作"))
+                                    },
+                                    "type": "primary",
+                                    "value": {
+                                        "action": button_row.get("value", button_row.get("callback_data", "click"))
+                                    }
+                                }
+                            ]
+                        })
 
                 content = {
                     "config": {
@@ -630,8 +648,8 @@ class Feishu:
         text = ""
         for media in medias:
             text += f"{media.title} ({media.year})\n"
-            if media.rating:
-                text += f"评分：{media.rating}\n"
+            if media.vote_average:
+                text += f"评分：{media.vote_average}\n"
             text += "\n"
         return self.send_msg(title, text, userid=userid, buttons=buttons,
                              original_message_id=original_message_id,
