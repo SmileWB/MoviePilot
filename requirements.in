@@ -57,7 +57,7 @@ click~=8.2.1
 requests-cache~=1.2.1
 parse~=1.20.2
 docker~=7.1.0
-pywin32==310; platform_system == "Windows"
+pywin32>=310; platform_system == "Windows"
 cachetools~=6.1.0
 fast-bencode~=1.1.7
 pystray~=0.19.5
@@ -93,3 +93,4 @@ openai~=1.108.2
 google-generativeai~=0.8.5
 ddgs~=9.10.0
 websocket-client~=1.8.0
+lark-oapi>=1.5.0

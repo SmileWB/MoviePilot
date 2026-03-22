@@ -9,7 +9,7 @@ import aiofiles
 import pillow_avif  # noqa 用于自动注册AVIF支持
 from anyio import Path as AsyncPath
 from app.helper.sites import SitesHelper  # noqa  # noqa
-from fastapi import APIRouter, Body, Depends, HTTPException, Header, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Header, Request, Response, Query
 from fastapi.responses import StreamingResponse
 
 from app import schemas
@@ -636,3 +636,186 @@ def run_scheduler2(jobid: str,
     else:
         Scheduler().start(jobid)
     return schemas.Response(success=True)
+
+
+@router.post("/notification/test", summary="测试通知发送", response_model=schemas.Response)
+def test_notification(
+        channel: str = Body(..., embed=True, description="通知渠道名称"),
+        title: str = Body(default="测试消息", description="消息标题"),
+        content: str = Body(default="这是一条测试消息", description="消息内容"),
+        _: User = Depends(get_current_active_superuser)):
+    """
+    测试通知发送（仅管理员）
+    """
+    try:
+        from app.core.module import ModuleManager
+        from app.schemas import Notification
+        from app.schemas.types import MessageChannel, ModuleType
+
+        # 获取通知模块管理器
+        module_manager = ModuleManager()
+
+        # 获取所有通知模块
+        notification_modules = module_manager.get_running_type_modules(ModuleType.Notification)
+
+        # 查找指定的通知渠道
+        target_module = None
+        target_config = None
+        channel = channel.strip()  # 去除空格
+        for module_instance in notification_modules:
+            if hasattr(module_instance, 'get_configs'):
+                configs = module_instance.get_configs()
+                if channel in configs:
+                    target_module = module_instance
+                    target_config = configs[channel]
+                    break
+
+        if not target_module:
+            return schemas.Response(
+                success=False,
+                message=f"未找到通知渠道：{channel}"
+            )
+
+        # 获取渠道类型
+        channel_type = target_config.type if target_config else None
+
+        # 确定 MessageChannel
+        try:
+            message_channel = MessageChannel(channel_type) if channel_type else MessageChannel.Web
+        except ValueError:
+            message_channel = MessageChannel.Web
+
+        # 发送测试消息
+        notification = Notification(
+            channel=message_channel,
+            title=title,
+            text=content,
+            targets={}
+        )
+
+        target_module.post_message(message=notification)
+
+        return schemas.Response(
+            success=True,
+            message=f"测试消息已发送到渠道：{channel}"
+        )
+    except Exception as e:
+        logger.error(f"测试通知发送失败：{str(e)}", exc_info=True)
+        return schemas.Response(
+            success=False,
+            message=f"发送失败：{str(e)}"
+        )
+
+
+@router.get("/notification/ws-status", summary="查询飞书长连接状态", response_model=schemas.Response)
+def get_feishu_ws_status(
+        channel: str = Query(..., description="通知渠道名称")):
+    """
+    查询飞书长连接状态
+    """
+    try:
+        from app.core.module import ModuleManager
+        from app.schemas.types import MessageChannel, ModuleType
+
+        module_manager = ModuleManager()
+
+        # 查找飞书模块
+        feishu_module = None
+        for module in module_manager.get_running_type_modules(ModuleType.Notification):
+            if hasattr(module, 'get_subtype'):
+                if module.get_subtype() == MessageChannel.Feishu:
+                    feishu_module = module
+                    break
+
+        if not feishu_module:
+            return schemas.Response(
+                success=False,
+                message="未找到飞书模块"
+            )
+
+        # 获取长连接状态
+        if hasattr(feishu_module, 'get_ws_status'):
+            status = feishu_module.get_ws_status(channel)
+            if status is None:
+                return schemas.Response(
+                    success=False,
+                    message=f"未找到配置「{channel}」，请先保存配置后再查询状态"
+                )
+            return schemas.Response(
+                success=True,
+                data=status
+            )
+        else:
+            return schemas.Response(
+                success=False,
+                message="飞书模块不支持长连接状态查询"
+            )
+
+    except Exception as e:
+        logger.error(f"查询飞书长连接状态失败：{str(e)}", exc_info=True)
+        return schemas.Response(
+            success=False,
+            message=f"查询失败：{str(e)}"
+        )
+
+
+@router.post("/notification/ws-reconnect", summary="重连飞书长连接", response_model=schemas.Response)
+def reconnect_feishu_ws(
+        channel: str = Query(..., description="通知渠道名称")):
+    """
+    重连飞书长连接
+    """
+    try:
+        from app.core.module import ModuleManager
+        from app.schemas.types import MessageChannel, ModuleType
+
+        module_manager = ModuleManager()
+
+        # 查找飞书模块
+        feishu_module = None
+        for module in module_manager.get_running_type_modules(ModuleType.Notification):
+            if hasattr(module, 'get_subtype'):
+                if module.get_subtype() == MessageChannel.Feishu:
+                    feishu_module = module
+                    break
+
+        if not feishu_module:
+            return schemas.Response(
+                success=False,
+                message="未找到飞书模块"
+            )
+
+        # 重连长连接
+        if hasattr(feishu_module, 'reconnect_ws'):
+            # 获取飞书实例
+            from app.modules.feishu.feishu import Feishu
+            client: Feishu = feishu_module.get_instance(channel)
+            if client:
+                result = client.reconnect_ws()
+                if result:
+                    return schemas.Response(
+                        success=True,
+                        message="长连接已重新建立"
+                    )
+                else:
+                    return schemas.Response(
+                        success=False,
+                        message="重连失败，请检查配置是否正确"
+                    )
+            else:
+                return schemas.Response(
+                    success=False,
+                    message="未找到飞书实例"
+                )
+        else:
+            return schemas.Response(
+                success=False,
+                message="飞书模块不支持长连接重连功能"
+            )
+
+    except Exception as e:
+        logger.error(f"重连飞书长连接失败：{str(e)}", exc_info=True)
+        return schemas.Response(
+            success=False,
+            message=f"重连失败：{str(e)}"
+        )

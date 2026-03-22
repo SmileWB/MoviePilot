@@ -116,6 +116,8 @@ class NotificationSwitch(BaseModel):
     webpush: Optional[bool] = False
     # QQ开关
     qq: Optional[bool] = False
+    # 飞书开关
+    feishu: Optional[bool] = False
 
 
 class Subscription(BaseModel):
@@ -280,6 +282,21 @@ class ChannelCapabilityManager:
                 ChannelCapability.IMAGES,
                 ChannelCapability.LINKS
             },
+            fallback_enabled=True
+        ),
+        MessageChannel.Feishu: ChannelCapabilities(
+            channel=MessageChannel.Feishu,
+            capabilities={
+                ChannelCapability.INLINE_BUTTONS,
+                ChannelCapability.MESSAGE_EDITING,
+                ChannelCapability.CALLBACK_QUERIES,
+                ChannelCapability.RICH_TEXT,
+                ChannelCapability.IMAGES,
+                ChannelCapability.LINKS
+            },
+            max_buttons_per_row=3,
+            max_button_rows=5,
+            max_button_text_length=30,
             fallback_enabled=True
         )
     }

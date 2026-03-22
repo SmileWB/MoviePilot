@@ -309,6 +309,7 @@ class MessageChannel(Enum):
     Web = "Web"
     WebPush = "WebPush"
     QQ = "QQ"
+    Feishu = "Feishu"
 
 
 # 下载器类型
