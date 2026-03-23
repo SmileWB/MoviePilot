@@ -133,6 +133,9 @@ class Feishu:
             # 注册按钮回调事件处理器
             builder.register_p2_card_action_trigger(self._handle_card_action)
 
+            # 注册消息已读事件处理器
+            builder.register_p2_im_message_message_read_v1(self._handle_message_read)
+
             # 构建事件处理器
             self._event_handler = builder.build()
 
@@ -376,6 +379,7 @@ class Feishu:
         except Exception as e:
             logger.error(f"处理飞书消息失败：{e}", exc_info=True)
 
+
     def _handle_card_action(self, data: P2CardActionTrigger) -> Optional[P2CardActionTriggerResponse]:
         """
         处理按钮回调事件
@@ -439,6 +443,30 @@ class Feishu:
         except Exception as e:
             logger.error(f"处理飞书按钮回调失败：{e}", exc_info=True)
             return None
+
+    def _handle_message_read(self, data: lark.im.v1.P2ImMessageMessageReadV1) -> None:
+        """
+        处理消息已读事件
+        当用户阅读机器人发送的消息后，飞书会推送此事件
+        """
+        try:
+            event = getattr(data, 'event', None)
+            if not event:
+                return
+
+            reader = getattr(event, 'reader', None)
+            if not reader:
+                return
+
+            reader_id = getattr(reader, 'reader_id', {})
+            open_id = getattr(reader_id, 'open_id', None)
+            read_time = getattr(reader, 'read_time', None)
+            message_id_list = getattr(event, 'message_id_list', [])
+
+            logger.info(f"飞书消息已读事件：open_id={open_id}, message_ids={message_id_list}, read_time={read_time}")
+
+        except Exception as e:
+            logger.error(f"处理飞书已读事件失败：{e}", exc_info=True)
 
     def _bind_default_user(self, userid: str, username: str,
                            original_message_id: str = None,
@@ -798,17 +826,109 @@ class Feishu:
     def send_medias_msg(self, title: str, medias: List[MediaInfo], userid: str = None,
                         buttons: list = None, original_message_id: str = None,
                         original_chat_id: str = None) -> bool:
-        """发送媒体信息消息"""
+        """发送媒体信息消息（纯文本格式）"""
+        # 构建文本消息
         text = ""
-        for media in medias:
-            text += f"{media.title} ({media.year})\n"
+        for i, media in enumerate(medias[:8], 1):  # 最多显示 8 个
+            # 构建媒体信息文本
+            media_text = f"**{i}. {media.title}**"
+            if media.year:
+                media_text += f" ({media.year})"
             if media.vote_average:
-                text += f"评分：{media.vote_average}\n"
-            text += "\n"
-        return self.send_msg(title, text, userid=userid, buttons=buttons,
-                             original_message_id=original_message_id,
-                             original_chat_id=original_chat_id,
-                             card_title="媒体列表")
+                media_text += f"\n评分：{media.vote_average}"
+            if media.overview:
+                # 概述截取前 50 个字符
+                overview = media.overview[:50] + "..." if len(media.overview) > 50 else media.overview
+                media_text += f"\n{overview}"
+            text += media_text + "\n\n"
+
+        # 调用 send_msg 发送文本消息
+        return self.send_msg(
+            title=title,
+            text=text,
+            userid=userid,
+            buttons=buttons,
+            original_message_id=original_message_id,
+            original_chat_id=original_chat_id,
+            card_title="媒体列表"
+        )
+
+    def _upload_image(self, image_url: str) -> str:
+        """
+        上传网络图片到飞书开放平台
+        :param image_url: 图片 URL
+        :return: img_key
+        """
+        if not image_url:
+            return ""
+
+        try:
+            import requests
+            from requests_toolbelt import MultipartEncoder
+
+            # 下载图片
+            response = requests.get(image_url, timeout=10)
+            if response.status_code != 200:
+                logger.warning(f"下载图片失败：{image_url}")
+                return ""
+
+            # 获取 tenant_access_token
+            token = self._get_tenant_access_token()
+            if not token:
+                logger.warning("获取 tenant_access_token 失败")
+                return ""
+
+            # 上传图片
+            url = "https://open.feishu.cn/open-apis/im/v1/images"
+            form = MultipartEncoder(
+                fields={
+                    'image_type': 'message',
+                    'image': ('poster.jpg', response.content, 'image/jpeg')
+                }
+            )
+
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': form.content_type
+            }
+
+            upload_response = requests.post(url, data=form, headers=headers, timeout=10)
+            result = upload_response.json()
+
+            if result.get('code') == 0 and result.get('data'):
+                img_key = result['data'].get('image_key', '')
+                logger.debug(f"图片上传成功：{img_key}")
+                return img_key
+            else:
+                logger.warning(f"上传图片失败：{result}")
+                return ""
+
+        except Exception as e:
+            logger.warning(f"上传图片异常：{e}")
+            return ""
+
+    def _get_tenant_access_token(self) -> str:
+        """获取 tenant_access_token"""
+        try:
+            import requests
+
+            url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            body = {
+                "app_id": self._app_id,
+                "app_secret": self._app_secret
+            }
+
+            response = requests.post(url, json=body, timeout=10)
+            result = response.json()
+
+            if result.get('code') == 0:
+                return result.get('tenant_access_token', '')
+            else:
+                logger.error(f"获取 token 失败：{result}")
+                return ""
+        except Exception as e:
+            logger.error(f"获取 token 异常：{e}")
+            return ""
 
     def send_torrents_msg(self, title: str, torrents: List[Context], userid: str = None,
                           buttons: list = None, original_message_id: str = None,
@@ -845,6 +965,86 @@ class Feishu:
                              original_message_id=original_message_id,
                              original_chat_id=original_chat_id,
                              card_title="种子列表")
+
+    def _send_custom_card_msg(self, title: str, elements: list, userid: str = None,
+                               buttons: list = None, original_message_id: str = None,
+                               original_chat_id: str = None, card_title: str = None) -> bool:
+        """发送自定义卡片消息（支持图片和自定义布局）"""
+        try:
+            # 使用默认用户 ID
+            if not userid:
+                userid = self._default_user_id
+                if not userid:
+                    logger.error("未指定用户 ID 且未配置默认用户，消息无法发送")
+                    return False
+
+            # 添加按钮到 elements
+            if buttons:
+                for button_row in buttons:
+                    if isinstance(button_row, list):
+                        columns = []
+                        for btn in button_row:
+                            columns.append({
+                                "tag": "column",
+                                "width": "auto",
+                                "weight": 1,
+                                "vertical_align": "top",
+                                "elements": [
+                                    {
+                                        "tag": "button",
+                                        "text": {
+                                            "tag": "plain_text",
+                                            "content": btn.get("text", btn.get("label", "操作"))
+                                        },
+                                        "type": "primary",
+                                        "behaviors": [
+                                            {
+                                                "type": "callback",
+                                                "value": {
+                                                    "action": btn.get("value", btn.get("callback_data", "click"))
+                                                }
+                                            }
+                                        ]
+                                    }
+                                ]
+                            })
+                        if columns:
+                            elements.append({
+                                "tag": "column_set",
+                                "flex_mode": "flow",
+                                "background_style": "default",
+                                "columns": columns
+                            })
+
+            # V2 卡片格式
+            content = {
+                "schema": "2.0",
+                "config": {
+                    "wide_screen_mode": True,
+                    "update_multi": True
+                },
+                "header": {
+                    "template": "blue",
+                    "title": {
+                        "tag": "plain_text",
+                        "content": card_title if card_title else title
+                    }
+                },
+                "body": {
+                    "elements": elements
+                }
+            }
+            msg_type = "interactive"
+
+            # 判断是发送消息还是回复消息
+            if original_message_id and original_chat_id:
+                return self._reply_message_v2(original_message_id, original_chat_id, msg_type, content, userid)
+            else:
+                return self._create_message_v2(userid, msg_type, content)
+
+        except Exception as e:
+            logger.error(f"发送飞书自定义卡片消息失败：{e}", exc_info=True)
+            return False
 
     def delete_msg(self, message_id: str, chat_id: str = None) -> bool:
         """删除消息"""
