@@ -252,6 +252,7 @@ class SMB(StorageBase, metaclass=WeakSingleton):
         """
         try:
             self._check_connection()
+            logger.debug(f"【SMB】连接检查通过：{self._server_path}")
 
             if fileitem.type == "file":
                 item = self.detail(fileitem)
@@ -261,10 +262,12 @@ class SMB(StorageBase, metaclass=WeakSingleton):
 
             # 构建SMB路径
             smb_path = self._normalize_path(fileitem.path.rstrip("/"))
+            logger.debug(f"【SMB】列出目录：path={fileitem.path}, smb_path={smb_path}")
 
             # 列出目录内容
             try:
                 entries = smbclient.listdir(smb_path)
+                logger.debug(f"【SMB】目录内容：{len(entries)} 个项目")
             except SMBResponseException as e:
                 logger.error(f"【SMB】列出目录失败: {smb_path} - {e}")
                 return []
@@ -286,6 +289,7 @@ class SMB(StorageBase, metaclass=WeakSingleton):
                     logger.debug(f"【SMB】获取文件信息失败: {entry_path} - {e}")
                     continue
 
+            logger.debug(f"【SMB】返回 {len(items)} 个项目")
             return items
         except Exception as e:
             logger.error(f"【SMB】列出文件失败: {e}")

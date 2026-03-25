@@ -645,6 +645,12 @@ class MessageChain(ChainBase):
                 ))
                 return
 
+        # 处理 subscribe_media 回调（订阅媒体）
+        if callback_data == 'subscribe_media':
+            self._handle_subscribe_callback(channel, source, userid, username,
+                                            original_message_id, original_chat_id)
+            return
+
     def _handle_download_callback(self, download_index: str, channel: MessageChannel, source: str,
                                    userid: Union[str, int], username: str,
                                    original_message_id: Optional[Union[str, int]] = None,
@@ -682,6 +688,71 @@ class MessageChain(ChainBase):
             # 开始下载
             DownloadChain().download_single(context, channel=channel, source=source,
                                            userid=userid, username=username)
+
+    def _handle_subscribe_callback(self, channel: MessageChannel, source: str,
+                                   userid: Union[str, int], username: str,
+                                   original_message_id: Optional[Union[str, int]] = None,
+                                   original_chat_id: Optional[str] = None) -> None:
+        """
+        处理订阅按钮回调
+        """
+        # 加载缓存
+        user_cache: Dict[str, dict] = self.load_cache(self._cache_file) or {}
+        cache_data: dict = user_cache.get(userid)
+        if not cache_data or not cache_data.get('items'):
+            self.post_message(Notification(channel=channel, source=source, title="无可用资源，请重新搜索！", userid=userid))
+            return
+
+        cache_list: list[Context] = cache_data.get('items')
+        if not cache_list:
+            self.post_message(Notification(channel=channel, source=source, title="无可用资源，请重新搜索！", userid=userid))
+            return
+
+        # 从第一个资源中获取媒体信息（所有种子都是同一个媒体的资源）
+        context = cache_list[0]
+        mediainfo = context.media_info
+
+        if not mediainfo:
+            self.post_message(Notification(channel=channel, source=source, title="无法获取媒体信息！", userid=userid))
+            return
+
+        # 检查是否已订阅
+        if SubscribeChain.exists(mediainfo=mediainfo, meta=_current_meta):
+            self.post_message(Notification(
+                channel=channel, source=source,
+                title=f"【{mediainfo.title_year}】已订阅，无需重复订阅！",
+                userid=userid
+            ))
+            return
+
+        # 添加订阅
+        mp_name = UserOper().get_name(**{f"{channel.name.lower()}_userid": userid}) if channel else None
+        sid, msg = SubscribeChain().add(
+            title=mediainfo.title,
+            year=mediainfo.year,
+            mtype=mediainfo.type,
+            tmdbid=mediainfo.tmdb_id,
+            season=_current_meta.begin_season if _current_meta else None,
+            channel=channel,
+            source=source,
+            userid=userid,
+            username=mp_name or username,
+            state="R",
+            best_version=True
+        )
+
+        if sid:
+            self.post_message(Notification(
+                channel=channel, source=source,
+                title=f"【{mediainfo.title_year}】订阅成功！",
+                userid=userid
+            ))
+        else:
+            self.post_message(Notification(
+                channel=channel, source=source,
+                title=f"订阅失败：{msg}",
+                userid=userid
+            ))
 
     def __auto_download(self, channel: MessageChannel, source: str, cache_list: list[Context],
                         userid: Union[str, int], username: str,
@@ -865,7 +936,7 @@ class MessageChain(ChainBase):
 
     def _create_torrent_buttons(self, channel: MessageChannel, items: list, total: int) -> List[List[Dict]]:
         """
-        创建种子下载按钮
+        创建种子下载按钮（包含订阅按钮）
         """
 
         global _current_page
@@ -873,8 +944,11 @@ class MessageChain(ChainBase):
         buttons = []
         max_per_row = ChannelCapabilityManager.get_max_buttons_per_row(channel)
 
-        # 自动选择按钮
-        buttons.append([{"text": "🤖 自动选择下载", "callback_data": "download_0"}])
+        # 自动选择下载 + 订阅按钮（放在同一行）
+        first_row = [{"text": "🤖 自动下载", "callback_data": "download_0"}]
+        # 添加订阅按钮
+        first_row.append({"text": "📅 订阅", "callback_data": "subscribe_media"})
+        buttons.append(first_row)
 
         # 为每个种子项创建下载按钮 - 每行显示多个按钮
         current_row = []

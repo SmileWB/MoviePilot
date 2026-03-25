@@ -104,6 +104,16 @@ class Feishu:
         self._ws_thread: Optional[threading.Thread] = None
         self._ws_running = False
 
+        # 心跳监控相关
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_running = False
+        self._last_pong_time: float = 0
+        self._heartbeat_interval = 30  # 心跳检测间隔（秒）
+        self._heartbeat_timeout = 90  # 心跳超时时间（秒），超过此时间未收到 pong 则重连
+        self._reconnect_delay = 5  # 重连延迟（秒）
+        self._reconnect_count = 0  # 重连次数
+        self._max_reconnect_attempts = 10  # 最大重连尝试次数
+
         # SDK 模式下自动启用长连接
         if self._mode == 'sdk' and SDK_AVAILABLE:
             self._init_official_sdk()
@@ -139,7 +149,7 @@ class Feishu:
             # 构建事件处理器
             self._event_handler = builder.build()
 
-            # 创建长连接客户端
+            # 创建长连接客户端（SDK 内置 auto_reconnect 和 ping/pong 机制）
             self._ws_client = WsClient(
                 app_id=self._app_id,
                 app_secret=self._app_secret,
@@ -155,7 +165,11 @@ class Feishu:
                 daemon=True
             )
             self._ws_thread.start()
-            logger.info("官方 SDK 长连接客户端已启动")
+
+            # 启动心跳监控线程
+            self._start_heartbeat_monitor()
+
+            logger.info("[Feishu] 官方 SDK 长连接客户端已启动，心跳监控已启用")
 
         except Exception as e:
             logger.error(f"初始化官方 SDK 失败：{e}", exc_info=True)
@@ -174,27 +188,168 @@ class Feishu:
         ws_client_module.loop = loop
 
         try:
+            # SDK 内部有 ping/pong 机制，收到 pong 时会自动更新内部状态
+            # 我们通过钩子函数监听日志来更新心跳时间
             self._ws_client.start()
         except Exception as e:
             logger.error(f"飞书长连接运行失败：{e}", exc_info=True)
+            self._ws_running = False
+            # 触发重连
+            self._schedule_reconnect()
         finally:
             try:
                 loop.close()
             except:
                 pass
 
+    def _start_heartbeat_monitor(self):
+        """启动心跳监控线程"""
+        self._heartbeat_running = True
+        self._last_pong_time = time.time()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_monitor_loop,
+            daemon=True
+        )
+        self._heartbeat_thread.start()
+        logger.info(f"[Feishu] 心跳监控已启动：间隔={self._heartbeat_interval}s, 超时={self._heartbeat_timeout}s")
+
+    def _heartbeat_monitor_loop(self):
+        """心跳监控循环 - 监听 SDK 日志中的 ping/pong"""
+        # 导入 SDK 的日志模块，监听 ping/pong
+        import logging
+
+        # 创建一个自定义日志处理器来捕获 SDK 的 ping/pong 日志
+        class HeartbeatLogHandler(logging.Handler):
+            def __init__(self, feishu_instance):
+                super().__init__()
+                self.feishu_instance = feishu_instance
+
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    if 'ping success' in msg or 'receive pong' in msg:
+                        self.feishu_instance._last_pong_time = time.time()
+                        logger.debug(f"[Feishu] 心跳更新：收到 ping/pong")
+                    elif 'connection close' in msg.lower() or 'disconnected' in msg.lower():
+                        logger.warning(f"[Feishu] 检测到连接断开")
+                        self.feishu_instance._ws_running = False
+                except Exception as e:
+                    print(f"HeartbeatLogHandler error: {e}")
+
+        # 获取 SDK 的日志记录器并添加处理器
+        sdk_logger = logging.getLogger('lark_oapi')
+        handler = HeartbeatLogHandler(self)
+        handler.setLevel(logging.DEBUG)
+        sdk_logger.addHandler(handler)
+
+        # 心跳监控主循环
+        while self._heartbeat_running:
+            try:
+                time.sleep(self._heartbeat_interval)
+
+                current_time = time.time()
+                time_since_last_pong = current_time - self._last_pong_time
+
+                # 记录最新的心跳状态
+                logger.debug(f"[Feishu] 心跳检查：距离上次 pong={time_since_last_pong:.1f}s")
+
+                # 检查是否超时
+                if time_since_last_pong > self._heartbeat_timeout:
+                    logger.warning(f"[Feishu] 心跳超时：{time_since_last_pong:.1f}s > {self._heartbeat_timeout}s，尝试重连...")
+                    self._reconnect()
+                else:
+                    # 更新状态显示
+                    if self._ws_running:
+                        logger.debug(f"[Feishu] 连接正常，心跳良好 (超时前：{self._heartbeat_timeout - time_since_last_pong:.1f}s)")
+
+            except Exception as e:
+                logger.error(f"[Feishu] 心跳监控异常：{e}", exc_info=True)
+
+    def _schedule_reconnect(self):
+        """调度重连"""
+        if self._reconnect_count >= self._max_reconnect_attempts:
+            logger.error(f"[Feishu] 达到最大重连尝试次数 ({self._max_reconnect_attempts})，停止重连")
+            self._heartbeat_running = False
+            return
+
+        self._reconnect_count += 1
+        logger.info(f"[Feishu] 计划重连：第 {self._reconnect_count}/{self._max_reconnect_attempts} 次，{self._reconnect_delay}秒后重试...")
+
+        # 延迟重连
+        def do_reconnect():
+            time.sleep(self._reconnect_delay)
+            if self._heartbeat_running:
+                self._reconnect()
+
+        threading.Thread(target=do_reconnect, daemon=True).start()
+
+    def _reconnect(self):
+        """执行重连"""
+        logger.info(f"[Feishu] 开始重连...")
+
+        try:
+            # 停止当前连接
+            self._ws_running = False
+            if self._ws_client:
+                try:
+                    self._ws_client.close()
+                except:
+                    pass
+
+            # 短暂等待
+            time.sleep(1)
+
+            # 重新创建客户端
+            self._ws_client = WsClient(
+                app_id=self._app_id,
+                app_secret=self._app_secret,
+                event_handler=self._event_handler,
+                log_level=LogLevel.INFO,
+                auto_reconnect=True
+            )
+
+            # 重新启动连接
+            self._ws_running = True
+            self._ws_thread = threading.Thread(
+                target=self._run_ws_loop,
+                daemon=True
+            )
+            self._ws_thread.start()
+
+            self._last_pong_time = time.time()
+            logger.info(f"[Feishu] 重连成功，新连接已建立")
+
+        except Exception as e:
+            logger.error(f"[Feishu] 重连失败：{e}", exc_info=True)
+            # 调度下一次重连
+            self._schedule_reconnect()
+
     def stop_long_connection(self):
         """停止长连接"""
         self._ws_running = False
-        # 停止线程
+        self._heartbeat_running = False
+
+        # 停止心跳监控线程
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=3)
+
+        # 停止长连接线程
         if self._ws_thread and self._ws_thread.is_alive():
             # 等待线程结束
             self._ws_thread.join(timeout=3)
+
+        # 关闭 WebSocket 客户端
+        if self._ws_client:
+            try:
+                self._ws_client.close()
+            except:
+                pass
+
         logger.info("飞书长连接已停止")
 
     def get_ws_status(self) -> Dict[str, Any]:
         """
-        获取长连接状态
+        获取长连接状态（包含心跳监控信息）
         :return: 状态信息
         """
         if not SDK_AVAILABLE:
@@ -211,24 +366,48 @@ class Feishu:
                 "message": "当前为 Webhook 模式，不支持长连接"
             }
 
+        # 计算心跳状态
+        current_time = time.time()
+        time_since_last_pong = current_time - self._last_pong_time if self._last_pong_time > 0 else -1
+        heartbeat_status = "healthy" if time_since_last_pong < self._heartbeat_timeout else "timeout"
+
         if self._ws_running and self._ws_thread and self._ws_thread.is_alive():
             return {
                 "connected": True,
                 "status": "connected",
-                "message": "官方 SDK 长连接已运行"
+                "message": "官方 SDK 长连接已运行",
+                "heartbeat": {
+                    "running": self._heartbeat_running,
+                    "last_pong_ago": f"{time_since_last_pong:.1f}s" if time_since_last_pong >= 0 else "unknown",
+                    "status": heartbeat_status,
+                    "interval": self._heartbeat_interval,
+                    "timeout": self._heartbeat_timeout
+                },
+                "reconnect": {
+                    "count": self._reconnect_count,
+                    "max_attempts": self._max_reconnect_attempts
+                }
             }
         else:
             return {
                 "connected": False,
                 "status": "disconnected",
-                "message": "长连接未运行，保存配置并重启模块后自动连接"
+                "message": "长连接未运行，保存配置并重启模块后自动连接",
+                "heartbeat": {
+                    "running": False,
+                    "last_pong_ago": "N/A",
+                    "status": "stopped"
+                },
+                "reconnect": {
+                    "count": self._reconnect_count,
+                    "max_attempts": self._max_reconnect_attempts
+                }
             }
 
     def reconnect_ws(self) -> bool:
         """
-        重新连接长连接
-        注意：官方 SDK 支持自动重连（auto_reconnect=True），无需手动触发
-        此方法仅在用户主动点击重连按钮时调用，会完全重建 SDK 实例
+        重新连接长连接（手动触发重连）
+        使用心跳监控模块的重连机制
         """
         if not SDK_AVAILABLE:
             logger.error("lark-oapi SDK 未安装，无法重连")
@@ -239,6 +418,10 @@ class Feishu:
             return False
 
         try:
+            # 重置心跳计时器和重连计数
+            self._last_pong_time = time.time()
+            self._reconnect_count = 0
+
             # 标记停止
             self._ws_running = False
 
@@ -320,11 +503,12 @@ class Feishu:
         处理接收到的消息事件
         """
         try:
-            logger.info(f"收到飞书消息：{data}")
+            logger.info(f"【飞书】收到飞书消息事件：{data}")
 
             # 从事件数据中提取信息
             event = getattr(data, 'event', None)
             if not event:
+                logger.warning("【飞书】事件数据中没有 event 字段")
                 return
 
             sender = getattr(event, 'sender', {})
@@ -335,7 +519,7 @@ class Feishu:
 
             # 检查消息是否已处理过
             if self._is_message_processed(message_id):
-                logger.info(f"消息已处理过，跳过：{message_id}")
+                logger.info(f"【飞书】消息已处理过，跳过：{message_id}")
                 return
 
             # 获取用户 ID
@@ -355,17 +539,20 @@ class Feishu:
             except:
                 pass
 
-            logger.info(f"收到飞书消息：userid={userid}, username={username}, text={text}")
+            logger.info(f"【飞书】收到消息：userid={userid}, username={username}, text={text}, chat_id={chat_id}")
 
             # 检查是否是绑定默认通知用户的命令
             if text and text.strip() == "绑定默认通知用户":
+                logger.info(f"【飞书】处理绑定命令")
                 self._bind_default_user(userid, username, message_id, chat_id)
 
             # 存储用户会话映射，用于回复
             if userid and chat_id:
                 self._user_chat_mapping[userid] = chat_id
+                logger.info(f"【飞书】记录用户会话映射：{userid} -> {chat_id}")
 
             # 调用 MessageChain 处理消息
+            logger.info(f"【飞书】开始调用 MessageChain 处理消息")
             from app.chain.message import MessageChain
             MessageChain().handle_message(
                 channel=MessageChannel.Feishu,
@@ -376,8 +563,9 @@ class Feishu:
                 original_message_id=message_id,
                 original_chat_id=chat_id
             )
+            logger.info(f"【飞书】MessageChain 处理完成")
         except Exception as e:
-            logger.error(f"处理飞书消息失败：{e}", exc_info=True)
+            logger.error(f"【飞书】处理飞书消息失败：{e}", exc_info=True)
 
 
     def _handle_card_action(self, data: P2CardActionTrigger) -> Optional[P2CardActionTriggerResponse]:
@@ -759,6 +947,8 @@ class Feishu:
     def _create_message_v2(self, userid: str, msg_type: str, content: Dict) -> bool:
         """发送消息到飞书 - 使用 V1 API 发送 V2 格式卡片"""
         try:
+            logger.info(f"【飞书】准备发送消息：userid={userid}, msg_type={msg_type}")
+
             # 构建请求 - 使用 V1 API，但内容是 V2 格式
             request = CreateMessageRequest.builder() \
                 .receive_id_type("open_id") \
@@ -777,22 +967,25 @@ class Feishu:
                 .log_level(LogLevel.DEBUG) \
                 .build()
 
+            logger.info(f"【飞书】正在调用 API 发送消息...")
             response = client.im.v1.message.create(request)
 
             if response.success():
-                logger.info(f"飞书 V2 卡片消息发送成功：{json_lib.dumps(content)}")
+                logger.info(f"【飞书】V2 卡片消息发送成功：{json_lib.dumps(content)}")
                 return True
             else:
-                logger.error(f"飞书 V2 卡片消息发送失败：{response.code}, {response.msg}")
+                logger.error(f"【飞书】V2 卡片消息发送失败：code={response.code}, msg={response.msg}, detail={response.raw_response}")
                 return False
 
         except Exception as e:
-            logger.error(f"发送飞书 V2 卡片消息失败：{e}", exc_info=True)
+            logger.error(f"【飞书】发送 V2 卡片消息失败：{e}", exc_info=True)
             return False
 
     def _reply_message_v2(self, message_id: str, chat_id: str, msg_type: str, content: Dict, userid: str) -> bool:
         """回复消息到飞书 - 使用 V1 API 发送 V2 格式卡片"""
         try:
+            logger.info(f"【飞书】准备回复消息：message_id={message_id}, userid={userid}, msg_type={msg_type}")
+
             # 构建请求 - 使用 V1 API，但内容是 V2 格式
             request = ReplyMessageRequest.builder() \
                 .message_id(message_id) \
@@ -810,17 +1003,18 @@ class Feishu:
                 .log_level(LogLevel.DEBUG) \
                 .build()
 
+            logger.info(f"【飞书】正在调用 API 回复消息...")
             response = client.im.v1.message.reply(request)
 
             if response.success():
-                logger.info(f"飞书 V2 卡片回复消息发送成功：{json_lib.dumps(content)}")
+                logger.info(f"【飞书】V2 卡片回复消息发送成功：{json_lib.dumps(content)}")
                 return True
             else:
-                logger.error(f"飞书 V2 卡片回复消息发送失败：{response.code}, {response.msg}")
+                logger.error(f"【飞书】V2 卡片回复消息发送失败：code={response.code}, msg={response.msg}, detail={response.raw_response}")
                 return False
 
         except Exception as e:
-            logger.error(f"回复飞书 V2 卡片消息失败：{e}", exc_info=True)
+            logger.error(f"【飞书】回复 V2 卡片消息失败：{e}", exc_info=True)
             return False
 
     def send_medias_msg(self, title: str, medias: List[MediaInfo], userid: str = None,
@@ -830,17 +1024,31 @@ class Feishu:
         # 构建文本消息
         text = ""
         for i, media in enumerate(medias[:8], 1):  # 最多显示 8 个
-            # 构建媒体信息文本
+            # 标题单独一行
             media_text = f"**{i}. {media.title}**"
             if media.year:
                 media_text += f" ({media.year})"
+            media_text += "\n"
+            # 类型和评分在同一行，带 emoji
+            info_parts = []
+            if media.type:
+                if media.type.value == "电影":
+                    info_parts.append(f"🎬【电影】")
+                elif media.type.value == "电视剧":
+                    info_parts.append(f"📺【电视剧】")
+                else:
+                    info_parts.append(f"【{media.type.value}】")
             if media.vote_average:
-                media_text += f"\n评分：{media.vote_average}"
+                info_parts.append(f"🍅评分：{media.vote_average}")
+            if info_parts:
+                media_text += f"{' '.join(info_parts)}"
             if media.overview:
                 # 概述截取前 50 个字符
                 overview = media.overview[:50] + "..." if len(media.overview) > 50 else media.overview
                 media_text += f"\n{overview}"
             text += media_text + "\n\n"
+
+        logger.info(f"[Feishu] 发送媒体消息：{title}, 数量：{len(medias)}")
 
         # 调用 send_msg 发送文本消息
         return self.send_msg(
