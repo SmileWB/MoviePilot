@@ -74,9 +74,13 @@ build/
 dist/
 *.egg-info/
 
+# Frontend (built separately and copied via Docker multi-stage)
+# frontend/
+# frontend_dist/
+
 # Docker
 Dockerfile*
-docker-compose*
+# docker-compose*
 .dockerignore
 
 # Other

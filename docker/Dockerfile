@@ -1,4 +1,4 @@
-FROM python:3.12.8-slim-bookworm AS base
+FROM docker.1panel.live/library/python:3.12.13-slim-bookworm AS base
 
 
 # 准备软件包
@@ -61,7 +61,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     busybox \
     jq \
-    wget
+    wget \
+    unzip
 
 # 安装 Python 构建依赖并创建虚拟环境
 WORKDIR /app
@@ -72,23 +73,26 @@ RUN python3 -m venv ${VENV_PATH} \
     && pip-compile requirements.in \
     && pip install -r requirements.txt
 
-# 下载准备代码
+
+# 准备代码
 FROM prepare_package AS prepare_code
 
 WORKDIR /app
 
+# 复制前端构建文件（本地）
+COPY frontend_dist/ /public/
+
+# 复制主项目代码
 COPY . .
-RUN FRONTEND_VERSION=$(sed -n "s/^FRONTEND_VERSION\s*=\s*'\([^']*\)'/\1/p" /app/version.py) \
-    && curl -sL "https://github.com/jxxghp/MoviePilot-Frontend/releases/download/${FRONTEND_VERSION}/dist.zip" | busybox unzip -d / - \
-    && mv /dist /public \
-    && curl -sL "https://github.com/jxxghp/MoviePilot-Plugins/archive/refs/heads/main.zip" | busybox unzip -d /tmp - \
+
+# 下载并复制插件
+RUN curl -sL "https://github.com/jxxghp/MoviePilot-Plugins/archive/refs/heads/main.zip" | busybox unzip -d /tmp - \
     && mv -f /tmp/MoviePilot-Plugins-main/plugins.v2/* /app/app/plugins/ \
     && cat /tmp/MoviePilot-Plugins-main/package.json | jq -r 'to_entries[] | select(.value.v2 == true) | .key' | awk '{print tolower($0)}' | \
-    while read -r i; do if [ ! -d "/app/app/plugins/$i" ]; then mv "/tmp/MoviePilot-Plugins-main/plugins/$i" "/app/app/plugins/"; else echo "跳过 $i"; fi; done \
-    && curl -sL "https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip" | busybox unzip -d /tmp - \
-    && mv -f /tmp/MoviePilot-Resources-main/resources.v2/* /app/app/helper/
+    while read -r i; do if [ ! -d "/app/app/plugins/$i" ]; then mv "/tmp/MoviePilot-Plugins-main/plugins/$i" "/app/app/plugins/"; else echo "跳过 $i"; fi; done
 
-# final 阶段: 安装运行时依赖和配置最终镜像
+
+# final 阶段：安装运行时依赖和配置最终镜像
 FROM prepare_package AS final
 
 ENV LD_PRELOAD="/usr/local/lib/libjemalloc.so"
